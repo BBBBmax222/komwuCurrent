@@ -16,12 +16,20 @@ from komwu import (
     KomwuEOEnd,
     KomwuKD,
     KomwuEOKD,
+    KomwuTolShrinkExp,
+    KomwuTolShrinkRuleA,
+    KomwuTolShrinkRuleBScale,
+    KomwuTolShrinkRuleBStop,
+    KomwuTolShrinkCutoff,
+    KomwuTolShrinkLip,
+    KomwuMinLogitsPeriodic,
+    KomwuMinLogitsAlways,
 )
 
 # ====================== EDIT THIS WHEN RUNNING IN VS CODE ======================
 CONFIG = {
     "game": "game_instances/K23.game",
-    "algos": "omwu,omwu_eo,omwu_kd,omwu_eo_kd",  # e.g. "omwu,omwu_kd,omwu_eo_kd"
+    "algos": "omwu,tolshrink_exp,tolshrink_rulea,tolshrink_ruleb_scale,tolshrink_ruleb_stop,tolshrink_cutoff,tolshrink_lip,minlogits_periodic,minlogits_always",  # defaults: baseline + all shrink variants
     "L": 5,
     "alpha_b": 1.0,
     "alpha_s": 3.0,
@@ -248,52 +256,173 @@ def run_one_game(
         "rho": float(default_rho),
     }
 
-    # One agent per player per algorithm
-    algo_bundles: list[tuple[str, list]] = []
+    # One agent per player per algorithm (with per-variant shrink metadata)
+    algo_bundles: list[dict] = []
+    shrink_variants = {
+        "tolshrink_exp": (KomwuTolShrinkExp, "tolshrink_exp"),
+        "tolshrink_rulea": (KomwuTolShrinkRuleA, "tolshrink_rulea"),
+        "tolshrink_ruleb_scale": (KomwuTolShrinkRuleBScale, "tolshrink_ruleb_scale"),
+        "tolshrink_ruleb_stop": (KomwuTolShrinkRuleBStop, "tolshrink_ruleb_stop"),
+        "tolshrink_cutoff": (KomwuTolShrinkCutoff, "tolshrink_cutoff"),
+        "tolshrink_lip": (KomwuTolShrinkLip, "tolshrink_lip"),
+        "minlogits_periodic": (KomwuMinLogitsPeriodic, "minlogits_periodic"),
+        "minlogits_always": (KomwuMinLogitsAlways, "minlogits_always"),
+    }
+
     for spec in algos:
+        base = spec.strip().split("[", 1)[0].strip().lower()
+
+        if base in shrink_variants:
+            cls, family = shrink_variants[base]
+            num_runs = 25
+            for idx in range(num_runs):
+                P = int(rng.integers(10, 30))
+                eps0 = float(rng.uniform(0.01, 0.4))
+                log_gamma = rng.uniform(np.log(1e-7), np.log(1e-1))
+                gamma = float(np.exp(log_gamma))
+
+                label = f"{family} #{idx+1} (P={P}, eps0={eps0:.3f}, gamma={gamma:.3e})"
+                agents = []
+                for p in range(game.n_players):
+                    if family == "minlogits_always":
+                        ag = cls(game.tpxs[p], eta=eta, dtype=DTYPE)
+                    elif family == "minlogits_periodic":
+                        ag = cls(game.tpxs[p], eta=eta, P=P, dtype=DTYPE)
+                    else:
+                        ag = cls(game.tpxs[p], eta=eta, P=P, eps0=eps0, gamma=gamma, dtype=DTYPE)
+                    ag.b += np.asarray(rng.normal(0, 1e-12, size=ag.b.shape), dtype=DTYPE)
+                    ag._compute_x()
+                    agents.append(ag)
+
+                shrink_meta = {
+                    "family": family,
+                    "mode": family,
+                    "P": 1 if family == "minlogits_always" else P,
+                    "eps0": eps0,
+                    "gamma": gamma,
+                    "C": getattr(agents[0], "C", 0.5),
+                    "tol": getattr(agents[0], "tol", 0.0),
+                    "scale_factor": getattr(agents[0], "scale_factor", 0.5),
+                    "gap_cutoff": getattr(agents[0], "gap_cutoff", 1e-4),
+                    "gap_ema": None,
+                    "gap_alpha": 0.1,
+                    "eps_scale": 1.0,
+                    "enabled": True,
+                    "step": 0,
+                }
+
+                algo_bundles.append({"label": label, "agents": agents, "family": family, "shrink": shrink_meta})
+            continue
+
         label, factory = make_algo(spec, defaults)
         agents = []
         for p in range(game.n_players):
             ag = factory(game.tpxs[p], eta, DTYPE)
-            # Tiny jitter in logits to break ties (optional)
             ag.b += np.asarray(rng.normal(0, 1e-12, size=ag.b.shape), dtype=DTYPE)
             ag._compute_x()
             agents.append(ag)
-        algo_bundles.append((label, agents))
+        algo_bundles.append({"label": label, "agents": agents, "family": label, "shrink": None})
 
     # Time-series metrics
     curves = {
-        label: {"times": [], "exploit": [], "nashconv": []}
-        for (label, _) in algo_bundles
+        bundle["label"]: {"times": [], "exploit": [], "nashconv": []}
+        for bundle in algo_bundles
     }
     regret_curves = (
         {
-            label: {"times": [], "max_regret": []}
-            for (label, _) in algo_bundles
+            bundle["label"]: {"times": [], "max_regret": []}
+            for bundle in algo_bundles
         }
         if plot_total_regret
         else {}
     )
 
+
     # ============================ main loop ============================
     for t in range(1, T + 1):
-        for (label, agents) in algo_bundles:
-            # 1) strategies for all players for this algorithm at time t
-            strategies = {p: agents[p].next_strategy() for p in range(game.n_players)}
+        for bundle in algo_bundles:
+            label = bundle["label"]
+            agents = bundle["agents"]
+            shrink_meta = bundle["shrink"]
 
-            # 2) gradients vs current profile
-            grads = [
-                utility_gradient_safe(game, p, strategies)
-                for p in range(game.n_players)
-            ]
+            strategies_pre = {p: agents[p].next_strategy() for p in range(game.n_players)}
+            grads = [utility_gradient_safe(game, p, strategies_pre) for p in range(game.n_players)]
 
-            # 3) update all players
             for p in range(game.n_players):
                 agents[p].observe_gradient(grads[p])
 
-            # 4) sample metrics
+            shrink_gap = None
+            strategies_post = {p: agents[p].next_strategy() for p in range(game.n_players)}
+            if shrink_meta is not None:
+                shrink_meta["step"] += 1
+                grads_post = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                nc, ex, _ = nash_conv_and_ev(game, strategies_post, grads=grads_post)
+                shrink_gap = abs(nc)
+                if shrink_meta["gap_ema"] is None:
+                    shrink_meta["gap_ema"] = shrink_gap
+                else:
+                    alpha = shrink_meta["gap_alpha"]
+                    shrink_meta["gap_ema"] = (1.0 - alpha) * shrink_meta["gap_ema"] + alpha * shrink_gap
+
+                P = shrink_meta["P"]
+                do_shrink = shrink_meta["enabled"] and P > 0 and (shrink_meta["step"] % P == 0)
+                if shrink_meta["mode"] == "tolshrink_cutoff" and shrink_meta["gap_ema"] is not None:
+                    if shrink_meta["gap_ema"] <= shrink_meta["gap_cutoff"]:
+                        shrink_meta["enabled"] = False
+                        do_shrink = False
+
+                if shrink_meta["mode"] == "tolshrink_rulea" and shrink_meta["gap_ema"] is not None and do_shrink:
+                    eps_check = shrink_meta["eps0"] * np.exp(-shrink_meta["gamma"] * shrink_meta["step"])
+                    if eps_check > shrink_meta["C"] * shrink_meta["gap_ema"]:
+                        do_shrink = False
+
+                if do_shrink:
+                    eps_t = shrink_meta["eps_scale"] * shrink_meta["eps0"] * np.exp(-shrink_meta["gamma"] * shrink_meta["step"])
+                    candidates = []
+                    for ag in agents:
+                        if shrink_meta["mode"].startswith("minlogits"):
+                            cand = ag.shrink_candidate_minlogits()
+                        elif shrink_meta["mode"] == "tolshrink_lip":
+                            cand = ag.shrink_candidate_lip(eps_t)
+                        else:
+                            cand = ag.shrink_candidate_tv(eps_t)
+                        candidates.append(cand)
+
+                    if shrink_meta["mode"] in {"tolshrink_ruleb_scale", "tolshrink_ruleb_stop"}:
+                        backups = [(ag.b.copy(), ag.next_strategy().copy()) for ag in agents]
+                        for ag, cand in zip(agents, candidates):
+                            ag.apply_candidate(cand[0], cand[1])
+                        strategies_post = {p: agents[p].next_strategy() for p in range(game.n_players)}
+                        grads_after = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                        nc_after, _, _ = nash_conv_and_ev(game, strategies_post, grads=grads_after)
+                        gap_after = abs(nc_after)
+                        tol = shrink_meta["tol"]
+                        if gap_after > (1.0 + tol) * shrink_gap:
+                            for ag, (b_old, x_old) in zip(agents, backups):
+                                ag.apply_candidate(b_old, x_old)
+                            if shrink_meta["mode"] == "tolshrink_ruleb_scale":
+                                shrink_meta["eps_scale"] *= shrink_meta["scale_factor"]
+                            else:
+                                shrink_meta["enabled"] = False
+                            strategies_post = {p: agents[p].next_strategy() for p in range(game.n_players)}
+                            grads_post = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                            nc, ex, _ = nash_conv_and_ev(game, strategies_post, grads=grads_post)
+                            shrink_gap = abs(nc)
+                        else:
+                            shrink_gap = gap_after
+                    else:
+                        for ag, cand in zip(agents, candidates):
+                            ag.apply_candidate(cand[0], cand[1])
+                        strategies_post = {p: agents[p].next_strategy() for p in range(game.n_players)}
+                        grads_post = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                        nc, ex, _ = nash_conv_and_ev(game, strategies_post, grads=grads_post)
+                        shrink_gap = abs(nc)
+                        shrink_meta["gap_ema"] = (1.0 - shrink_meta["gap_alpha"]) * shrink_meta["gap_ema"] + shrink_meta["gap_alpha"] * shrink_gap
+
+            # sample metrics
             if (t % plot_every) == 0 or t == 1:
-                nc, ex, _ = nash_conv_and_ev(game, strategies, grads=grads)
+                grads_sample = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                nc, ex, _ = nash_conv_and_ev(game, strategies_post, grads=grads_sample)
                 curves[label]["times"].append(t)
                 curves[label]["exploit"].append(ex)
                 curves[label]["nashconv"].append(nc)
@@ -304,7 +433,6 @@ def run_one_game(
                     regret_curves[label]["times"].append(t)
                     regret_curves[label]["max_regret"].append(max_reg)
 
-            # 5) logging
             if (t % print_every) == 0 or t == 1:
                 ex = curves[label]["exploit"][-1] if curves[label]["exploit"] else float("nan")
                 nc = curves[label]["nashconv"][-1] if curves[label]["nashconv"] else float("nan")
@@ -313,11 +441,47 @@ def run_one_game(
                     f"nashconv={nc:.6e}  η={eta:.2e}"
                 )
 
+        # ensure final sample at T
+        if t == T:
+            for bundle in algo_bundles:
+                label = bundle["label"]
+                agents = bundle["agents"]
+                strategies_post = {p: agents[p].next_strategy() for p in range(game.n_players)}
+                grads_sample = [utility_gradient_safe(game, p, strategies_post) for p in range(game.n_players)]
+                nc, ex, _ = nash_conv_and_ev(game, strategies_post, grads=grads_sample)
+                if curves[label]["times"] and curves[label]["times"][-1] == T:
+                    continue
+                curves[label]["times"].append(T)
+                curves[label]["exploit"].append(ex)
+                curves[label]["nashconv"].append(nc)
+
+    # select best shrink run per family (by final exploitability)
+    family_best_label: dict[str, str] = {}
+    shrink_families = set(shrink_variants.keys())
+    for bundle in algo_bundles:
+        label = bundle["label"]
+        fam = bundle["family"]
+        final_val = curves[label]["exploit"][-1] if curves[label]["exploit"] else float("inf")
+        if fam not in shrink_families:
+            family_best_label[label] = label
+            continue
+        best_so_far = family_best_label.get(fam)
+        if best_so_far is None:
+            family_best_label[fam] = label
+        else:
+            prev_val = curves[best_so_far]["exploit"][-1] if curves[best_so_far]["exploit"] else float("inf")
+            if final_val < prev_val:
+                family_best_label[fam] = label
+
+    plot_labels = set(family_best_label.values())
+
     # ============================= plots ==============================
 
     # Exploitability curve(s)
     plt.figure(figsize=(8, 5))
     for label in curves:
+        if label not in plot_labels:
+            continue
         xs = np.array(curves[label]["times"], dtype=float)
         ys = np.array(curves[label]["exploit"], dtype=float)
         plt.plot(xs, ys, label=label)
@@ -333,7 +497,11 @@ def run_one_game(
     # Regret curves (max per-player regret vs iteration)
     if plot_total_regret:
         print("\n=== Final regrets (per algorithm, per player) ===")
-        for (label, agents) in algo_bundles:
+        for bundle in algo_bundles:
+            label = bundle["label"]
+            agents = bundle["agents"]
+            if label not in plot_labels:
+                continue
             regs = [float(ag.regret()) for ag in agents]
             total = sum(regs)
             max_reg = max(regs)
@@ -342,6 +510,8 @@ def run_one_game(
 
         plt.figure(figsize=(8, 5))
         for label in regret_curves:
+            if label not in plot_labels:
+                continue
             xs = np.array(regret_curves[label]["times"], dtype=float)
             ys = np.array(regret_curves[label]["max_regret"], dtype=float)
             plt.plot(xs, ys, label=label)

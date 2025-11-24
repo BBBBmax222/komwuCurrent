@@ -335,6 +335,216 @@ class KomwuKD(Komwu):
         self.last_gradient = g_t
 
 
+class KomwuTolShrinkBase(Komwu):
+    """Shared helpers for TolShrink-style variants."""
+
+    def _minimal_centered_logits(self, x: np.ndarray) -> np.ndarray:
+        base = np.zeros_like(x, dtype=self.dtype)
+        for infoset in self.tpx.infosets:
+            parent_seq = infoset.parent_sequence_id
+            parent_prob = x[parent_seq]
+            parent_prob = max(parent_prob, 1e-16)
+            start = infoset.start_sequence_id
+            end = infoset.end_sequence_id + 1
+            local = x[start:end] / parent_prob
+            local = np.clip(local, 1e-16, 1.0)
+            log_local = np.log(local)
+            log_local -= np.mean(log_local)
+            base[start:end] = log_local
+        return base
+
+    def _strategy_from_logits(self, logits: np.ndarray) -> np.ndarray:
+        K_j = [None] * self.tpx.n_infosets
+        for infoset_id, infoset in enumerate(self.tpx.infosets):
+            terms = []
+            for seq in range(infoset.start_sequence_id, infoset.end_sequence_id + 1):
+                child_sum = self.dtype(0.0)
+                for child_infoset in self.tpx.children[seq]:
+                    child_sum += K_j[child_infoset.infoset_id]
+                terms.append(logits[seq] + child_sum)
+            K_j[infoset_id] = logsumexp_np(np.asarray(terms, dtype=self.dtype))
+
+        y = np.zeros(self.tpx.n_sequences, dtype=self.dtype)
+        for infoset in reversed(self.tpx.infosets):
+            Kj = K_j[infoset.infoset_id]
+            y_parent = y[infoset.parent_sequence_id]
+            for seq in range(infoset.start_sequence_id, infoset.end_sequence_id + 1):
+                child_sum = self.dtype(0.0)
+                for child_infoset in self.tpx.children[seq]:
+                    child_sum += K_j[child_infoset.infoset_id]
+                y[seq] = y_parent + logits[seq] + child_sum - Kj
+        return np.exp(y)
+
+    def _tv_dist(self, p: np.ndarray, q: np.ndarray) -> float:
+        return 0.5 * float(np.sum(np.abs(p - q)))
+
+    def _minimal_scale_tv(
+        self, base_logits: np.ndarray, target_x: np.ndarray, eps_tv: float, n_steps: int = 25
+    ) -> float:
+        uniform_logits = np.zeros_like(base_logits, dtype=self.dtype)
+        uniform_x = self._strategy_from_logits(uniform_logits)
+        if self._tv_dist(uniform_x, target_x) <= eps_tv:
+            return 0.0
+
+        lo, hi = 0.0, 1.0
+        for _ in range(n_steps):
+            mid = 0.5 * (lo + hi)
+            trial_logits = self.dtype(mid) * base_logits
+            q = self._strategy_from_logits(trial_logits)
+            if self._tv_dist(q, target_x) <= eps_tv:
+                hi = mid
+            else:
+                lo = mid
+        return hi
+
+    def _lipschitz_TV_constant(self, p: np.ndarray) -> float:
+        p = np.asarray(p, dtype=self.dtype)
+        p = p / max(np.sum(p), self.dtype(1e-16))
+        logp = np.log(np.clip(p, 1e-16, 1.0))
+        H = np.sum(p * logp)
+        return 0.5 * float(np.sum(np.abs(p * (logp - H))))
+
+    def _one_shot_scale_tv_lip(self, p: np.ndarray, eps_tv: float) -> float:
+        L = self._lipschitz_TV_constant(p)
+        if L <= 1e-16:
+            return 1.0
+        s = 1.0 - (eps_tv / L)
+        s = min(max(s, 0.0), 1.0)
+        return s
+
+    # --------- candidates (do not mutate state) ---------
+    def shrink_candidate_tv(self, eps_tv: float):
+        base_logits = self._minimal_centered_logits(self.x)
+        s = self._minimal_scale_tv(base_logits, self.x, eps_tv)
+        candidate_logits = self.dtype(s) * base_logits
+        candidate_x = self._strategy_from_logits(candidate_logits)
+        tv_val = self._tv_dist(self.x, candidate_x)
+        return candidate_logits, candidate_x, s, tv_val
+
+    def shrink_candidate_lip(self, eps_tv: float):
+        base_logits = self._minimal_centered_logits(self.x)
+        s = self._one_shot_scale_tv_lip(self.x, eps_tv)
+        candidate_logits = self.dtype(s) * base_logits
+        candidate_x = self._strategy_from_logits(candidate_logits)
+        tv_val = self._tv_dist(self.x, candidate_x)
+        return candidate_logits, candidate_x, s, tv_val
+
+    def shrink_candidate_minlogits(self):
+        candidate_logits = self._minimal_centered_logits(self.x)
+        candidate_x = self._strategy_from_logits(candidate_logits)
+        tv_val = self._tv_dist(self.x, candidate_x)
+        return candidate_logits, candidate_x, 1.0, tv_val
+
+    def apply_candidate(self, logits: np.ndarray, strategy: np.ndarray):
+        self.b = np.asarray(logits, dtype=self.dtype)
+        self.x = np.asarray(strategy, dtype=self.dtype)
+
+
+class KomwuTolShrinkExp(KomwuTolShrinkBase):
+    """
+    TolShrink-exp (baseline): shrink every P steps with ε_t = ε0 * exp(-γ t).
+    """
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self._step = 0
+
+    def observe_gradient(self, gradient: np.ndarray):
+        g_t = np.asarray(gradient, dtype=self.dtype)
+
+        self.sum_gradients += g_t
+        self.sum_ev += g_t.dot(self.next_strategy())
+
+        d_t = (self.dtype(2.0) * g_t) - self.last_gradient
+        self.b += self.dtype(self.eta) * d_t
+        self._compute_x()
+        self.last_gradient = g_t
+        self._step += 1
+
+
+class KomwuTolShrinkRuleA(KomwuTolShrinkBase):
+    """TolShrink with Rule A (gap-relative tolerance)."""
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, C: float = 0.5, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self.C = float(C)
+
+
+class KomwuTolShrinkRuleBScale(KomwuTolShrinkBase):
+    """TolShrink with Rule B (scale on rejection)."""
+
+    def __init__(
+        self,
+        tpx,
+        eta: float = 0.3,
+        P: int = 20,
+        eps0: float = 0.1,
+        gamma: float = 1e-4,
+        tol: float = 0.0,
+        scale_factor: float = 0.5,
+        dtype=None,
+    ):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self.tol = float(tol)
+        self.scale_factor = float(scale_factor)
+
+
+class KomwuTolShrinkRuleBStop(KomwuTolShrinkBase):
+    """TolShrink with Rule B (permanently stop on rejection)."""
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, tol: float = 0.0, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self.tol = float(tol)
+
+
+class KomwuTolShrinkCutoff(KomwuTolShrinkBase):
+    """TolShrink with cutoff rule."""
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, gap_cutoff: float = 1e-4, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self.gap_cutoff = float(gap_cutoff)
+
+
+class KomwuTolShrinkLip(KomwuTolShrinkBase):
+    """TolShrink-Lip (one-shot Lipschitz shrink every P steps)."""
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+
+
+class KomwuMinLogitsPeriodic(KomwuTolShrinkBase):
+    """Minimal-logits rewrite every P steps."""
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+
+
+class KomwuMinLogitsAlways(KomwuTolShrinkBase):
+    """Minimal-logits rewrite every step."""
+
+    def __init__(self, tpx, eta: float = 0.3, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+
+
 class KomwuEOKD(Komwu):
     """
     OMWU-EO-KD:
