@@ -106,6 +106,240 @@ class Komwu(object):
         self.x = np.exp(y)
         assert self.tpx.is_sf_strategy(self.x), "x is not a valid sequence-form strategy"
 
+
+# ===================== Matrix-game TolShrink (baseline) =====================
+
+def softmax_vec(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable softmax for 1D vectors."""
+
+    logits = np.asarray(logits, dtype=float)
+    logits = logits - np.max(logits)
+    e = np.exp(logits)
+    return e / e.sum()
+
+
+def logits_from_dist(p: np.ndarray) -> np.ndarray:
+    """Centered logits whose softmax is p exactly."""
+
+    p = np.asarray(p, dtype=float)
+    p = p / p.sum()
+    logp = np.log(np.clip(p, 1e-16, 1.0))
+    return logp - logp.mean()
+
+
+def duality_gap_matrix(A: np.ndarray, x: np.ndarray, y: np.ndarray) -> float:
+    """Duality gap using pure best responses for a normal-form matrix game."""
+
+    row_values = A @ y
+    col_values = x @ A
+
+    row_br = np.max(row_values)
+    col_br = np.min(col_values)
+    return float(row_br - col_br)
+
+
+def tv_dist(p: np.ndarray, q: np.ndarray) -> float:
+    """Total variation distance = 0.5 * L1."""
+
+    return 0.5 * np.abs(p - q).sum()
+
+
+def minimal_scale_tv(base_logits: np.ndarray, target_p: np.ndarray, eps_tv: float, n_steps: int = 20) -> float:
+    """Smallest s in [0, 1] so that TV(softmax(s * base_logits), target_p) <= eps_tv."""
+
+    uniform = np.ones_like(target_p) / len(target_p)
+    if tv_dist(uniform, target_p) <= eps_tv:
+        return 0.0
+
+    lo, hi = 0.0, 1.0
+    for _ in range(n_steps):
+        mid = 0.5 * (lo + hi)
+        q = softmax_vec(mid * base_logits)
+        if tv_dist(q, target_p) <= eps_tv:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def run_omwu_matrix(
+    A: np.ndarray,
+    T: int,
+    eta: float,
+    x0: np.ndarray | None = None,
+    y0: np.ndarray | None = None,
+):
+    """Baseline OMWU for a two-player zero-sum matrix game."""
+
+    n, m = A.shape
+
+    if x0 is None:
+        x0 = np.ones(n) / n
+    if y0 is None:
+        y0 = np.ones(m) / m
+
+    logx = logits_from_dist(x0)
+    logy = logits_from_dist(y0)
+
+    x = softmax_vec(logx)
+    y = softmax_vec(logy)
+
+    gaps = np.zeros(T + 1)
+    gaps[0] = duality_gap_matrix(A, x, y)
+
+    prev_lx = np.zeros_like(logx)
+    prev_ly = np.zeros_like(logy)
+
+    for t in range(T):
+        lx = A @ y
+        ly = -A.T @ x
+
+        mx = 2.0 * lx - prev_lx
+        my = 2.0 * ly - prev_ly
+
+        logx += eta * mx
+        logy += eta * my
+        x = softmax_vec(logx)
+        y = softmax_vec(logy)
+
+        prev_lx, prev_ly = lx, ly
+        gaps[t + 1] = duality_gap_matrix(A, x, y)
+
+    return gaps
+
+
+def run_tolshrink_exp(
+    A: np.ndarray,
+    T: int,
+    eta: float,
+    P: int,
+    eps0: float,
+    gamma: float,
+    x0: np.ndarray | None = None,
+    y0: np.ndarray | None = None,
+):
+    """TolShrink-base (TolShrink-exp) with exponential TV tolerance schedule."""
+
+    n, m = A.shape
+
+    if x0 is None:
+        x0 = np.ones(n) / n
+    if y0 is None:
+        y0 = np.ones(m) / m
+
+    logx = logits_from_dist(x0)
+    logy = logits_from_dist(y0)
+
+    x = softmax_vec(logx)
+    y = softmax_vec(logy)
+
+    gaps = np.zeros(T + 1)
+    gaps[0] = duality_gap_matrix(A, x, y)
+
+    prev_lx = np.zeros_like(logx)
+    prev_ly = np.zeros_like(logy)
+
+    for t in range(T):
+        step = t + 1
+
+        lx = A @ y
+        ly = -A.T @ x
+
+        mx = 2.0 * lx - prev_lx
+        my = 2.0 * ly - prev_ly
+
+        logx += eta * mx
+        logy += eta * my
+        x = softmax_vec(logx)
+        y = softmax_vec(logy)
+
+        prev_lx, prev_ly = lx, ly
+
+        gap_pre = duality_gap_matrix(A, x, y)
+
+        if step % P == 0:
+            eps_t = eps0 * np.exp(-gamma * step)
+
+            base_logits_x = np.log(np.clip(x, 1e-16, 1.0))
+            base_logits_x -= base_logits_x.mean()
+            base_logits_y = np.log(np.clip(y, 1e-16, 1.0))
+            base_logits_y -= base_logits_y.mean()
+
+            s_x = minimal_scale_tv(base_logits_x, x, eps_t)
+            s_y = minimal_scale_tv(base_logits_y, y, eps_t)
+
+            logx = s_x * base_logits_x
+            logy = s_y * base_logits_y
+            x = softmax_vec(logx)
+            y = softmax_vec(logy)
+
+            gap_curr = duality_gap_matrix(A, x, y)
+        else:
+            gap_curr = gap_pre
+
+        gaps[step] = gap_curr
+
+    return gaps
+
+
+# ===================== Matrix game definitions =====================
+
+def game_matrix_forgetfulness(delta: float = 0.01) -> np.ndarray:
+    return np.array([[0.5 + delta, 0.5], [0.0, 1.0]], dtype=float)
+
+
+def game_matrix_biased_rps(eps: float = 0.1) -> np.ndarray:
+    return np.array(
+        [
+            [0.0, -1.0 - eps, 1.0],
+            [1.0 + eps, 0.0, -1.0 - eps],
+            [-1.0, 1.0 + eps, 0.0],
+        ],
+        dtype=float,
+    )
+
+
+def game_matrix_random_uniform(n: int = 5, m: int = 5, seed: int = 4) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.uniform(0.0, 1.0, size=(n, m))
+
+
+def game_matrix_blotto_4x3() -> np.ndarray:
+    return np.array(
+        [
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def _blotto_allocations(T_total: int, B: int = 3):
+    if B == 1:
+        yield (T_total,)
+        return
+    for x0 in range(T_total + 1):
+        for rest in _blotto_allocations(T_total - x0, B - 1):
+            yield (x0,) + rest
+
+
+def game_matrix_blotto_3fields(T_total: int) -> np.ndarray:
+    allocs = list(_blotto_allocations(T_total, B=3))
+    n = len(allocs)
+    A = np.zeros((n, n), dtype=float)
+    for i, x in enumerate(allocs):
+        for j, y in enumerate(allocs):
+            payoff = 0.0
+            for xi, yi in zip(x, y):
+                if xi > yi:
+                    payoff += 1.0
+                elif xi < yi:
+                    payoff -= 1.0
+            A[i, j] = payoff
+    return A
+
 # ===================== Variants that keep KOMWU core =====================
 
 class KomwuL(Komwu):
