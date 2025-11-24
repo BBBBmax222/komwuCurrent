@@ -16,6 +16,13 @@ from komwu import (
     KomwuEOEnd,
     KomwuKD,
     KomwuEOKD,
+    run_omwu_matrix,
+    run_tolshrink_exp,
+    game_matrix_biased_rps,
+    game_matrix_blotto_3fields,
+    game_matrix_blotto_4x3,
+    game_matrix_forgetfulness,
+    game_matrix_random_uniform,
 )
 
 # ====================== EDIT THIS WHEN RUNNING IN VS CODE ======================
@@ -35,6 +42,11 @@ CONFIG = {
     "seed": 0,
     # When True: track and plot max per-player regret over time (no bar chart).
     "plot_total_regret": True,
+    # Matrix-game TolShrink sweep (set True to run instead of treeplex runner)
+    "matrix_sweep": False,
+    "matrix_games": "blotto_4x3",
+    "matrix_runs": 50,
+    "random5_seed": 4,
 }
 # =============================================================================
 
@@ -44,6 +56,44 @@ def get_dtype(precision: str):
     if precision not in {"normal", "precise"}:
         raise ValueError("precision must be 'normal' or 'precise'")
     return np.float64 if precision == "normal" else np.longdouble
+
+
+# ============================ matrix games ============================
+
+def load_matrix_game(name: str, random5_seed: int = 4):
+    """Return (A, label, x0, y0) for a named matrix game."""
+
+    key = name.strip().lower()
+
+    if key == "forgetfulness":
+        A = game_matrix_forgetfulness()
+        label = "Forgetfulness game (δ=0.01)"
+        x0 = y0 = None
+    elif key == "biased_rps":
+        A = game_matrix_biased_rps(eps=1e-7)
+        label = "Biased RPS (ε=1e-7)"
+        x0 = np.array([0.7, 0.2, 0.1])
+        y0 = np.array([0.2, 0.6, 0.2])
+    elif key == "random_5x5":
+        A = game_matrix_random_uniform(n=5, m=5, seed=random5_seed)
+        label = f"Random 5x5 U[0,1] (seed={random5_seed})"
+        x0 = y0 = None
+    elif key == "blotto_4x3":
+        A = game_matrix_blotto_4x3()
+        label = "Toy Blotto 4x3"
+        x0 = y0 = None
+    elif key == "blotto_t4":
+        A = game_matrix_blotto_3fields(T_total=4)
+        label = "Blotto 3 fields, T=4 (15x15)"
+        x0 = y0 = None
+    elif key == "blotto_t5":
+        A = game_matrix_blotto_3fields(T_total=5)
+        label = "Blotto 3 fields, T=5 (21x21)"
+        x0 = y0 = None
+    else:
+        raise ValueError(f"Unknown matrix game '{name}'")
+
+    return A, label, x0, y0
 
 
 def utility_gradient_safe(game: Game, p: int, strategies: dict[int, np.ndarray]) -> np.ndarray:
@@ -93,6 +143,90 @@ def nash_conv_and_ev(
 
     ev0 = evs[0]
     return nconv, exploit, ev0
+
+
+# ============================== TolShrink sweep ===============================
+
+def run_matrix_tolshrink_sweep(
+    game_names: list[str],
+    T: int,
+    eta: float,
+    seed: int,
+    num_games: int = 50,
+    random5_seed: int = 4,
+):
+    """Run TolShrink-exp sweeps on matrix games and plot best runs vs OMWU."""
+
+    rng = np.random.default_rng(seed)
+
+    for game_name in game_names:
+        A, label, x0, y0 = load_matrix_game(game_name, random5_seed=random5_seed)
+
+        print(f"\n=== Matrix game: {label} ===")
+        gaps_omwu = run_omwu_matrix(A, T, eta, x0=x0, y0=y0)
+        omwu_final = float(gaps_omwu[-1])
+        omwu_min = float(gaps_omwu[1:].min())
+        print(
+            f"OMWU baseline → final gap {omwu_final:.3e}, min gap {omwu_min:.3e}"
+        )
+
+        best = {
+            "final_gap": np.inf,
+            "min_gap": np.inf,
+            "P": None,
+            "eps0": None,
+            "gamma": None,
+            "gaps": None,
+        }
+
+        for k in range(num_games):
+            P = int(rng.integers(10, 30))
+            eps0 = float(rng.uniform(0.01, 0.4))
+            gamma = float(np.exp(rng.uniform(np.log(1e-7), np.log(1e-1))))
+
+            gaps = run_tolshrink_exp(A, T, eta, P=P, eps0=eps0, gamma=gamma, x0=x0, y0=y0)
+            final_gap = float(gaps[-1])
+            min_gap = float(gaps[1:].min())
+
+            if final_gap < best["final_gap"]:
+                best = {
+                    "final_gap": final_gap,
+                    "min_gap": min_gap,
+                    "P": P,
+                    "eps0": eps0,
+                    "gamma": gamma,
+                    "gaps": gaps,
+                }
+                print(
+                    f"  [run {k+1:02d}/{num_games}] New best-final → final {final_gap:.3e}, "
+                    f"min {min_gap:.3e}, P={P}, eps0={eps0:.3e}, gamma={gamma:.3e}"
+                )
+
+        if best["gaps"] is None:
+            print("No TolShrink runs completed.")
+            continue
+
+        iters = np.arange(1, T + 1)
+        plt.figure(figsize=(8, 6))
+
+        label_omwu = f"OMWU (final={omwu_final:.2e}, min={omwu_min:.2e})"
+        plt.loglog(iters, gaps_omwu[1:], label=label_omwu, linewidth=2.5, color="C0")
+
+        best_label = (
+            f"TolShrink-base P={best['P']}, eps0={best['eps0']:.2e}, gamma={best['gamma']:.2e} "
+            f"(final={best['final_gap']:.2e}, min={best['min_gap']:.2e})"
+        )
+        plt.loglog(iters, best["gaps"][1:], label=best_label, linewidth=2.0, color="C1")
+
+        plt.xlabel("Iteration")
+        plt.ylabel("Duality gap")
+        plt.title(f"{label}: OMWU vs TolShrink-base (best of {num_games})")
+        plt.grid(True, which="both", linestyle=":")
+        plt.ylim(1e-16, 1.0)
+        plt.legend(fontsize=9)
+        plt.tight_layout()
+
+    plt.show()
 
 # ============================== algo factory ============================
 
@@ -406,12 +540,49 @@ def build_arg_parser():
     )
     ap.add_argument("--no-plot-total-regret", dest="plot_total_regret", action="store_false")
     ap.set_defaults(plot_total_regret=False)
+
+    # Matrix-game TolShrink sweep
+    ap.add_argument(
+        "--matrix-sweep",
+        action="store_true",
+        help="Run matrix-game TolShrink-exp sweep instead of treeplex runner.",
+    )
+    ap.add_argument(
+        "--matrix-games",
+        type=str,
+        default="",
+        help="Comma-separated matrix games (e.g., blotto_4x3,biased_rps,random_5x5).",
+    )
+    ap.add_argument(
+        "--matrix-runs",
+        type=int,
+        default=50,
+        help="Number of hyperparameter draws for TolShrink-exp sweep.",
+    )
+    ap.add_argument(
+        "--random5-seed",
+        type=int,
+        default=4,
+        help="Seed for the random_5x5 matrix game variant.",
+    )
     return ap
 
 
 def main_cli():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.matrix_sweep:
+        games = [s for s in args.matrix_games.split(",") if s.strip()] or ["blotto_4x3"]
+        run_matrix_tolshrink_sweep(
+            games,
+            T=args.T,
+            eta=args.eta,
+            seed=args.seed,
+            num_games=args.matrix_runs,
+            random5_seed=args.random5_seed,
+        )
+        return
+
     algos = [s for s in args.algos.split(",") if s.strip()]
     run_one_game(
         path=args.game,
@@ -451,15 +622,35 @@ def main_vscode():
     )
 
 
+def main_matrix_config():
+    games = [s for s in CONFIG.get("matrix_games", "").split(",") if s.strip()] or ["blotto_4x3"]
+    run_matrix_tolshrink_sweep(
+        games,
+        T=int(CONFIG["T"]),
+        eta=float(CONFIG["eta"]),
+        seed=int(CONFIG["seed"]),
+        num_games=int(CONFIG.get("matrix_runs", 50)),
+        random5_seed=int(CONFIG.get("random5_seed", 4)),
+    )
+
+
 if __name__ == "__main__":
     # If any CLI-style arg is present, use CLI; otherwise use CONFIG (VS Code).
     if len(sys.argv) > 1 and any(arg.startswith("-") for arg in sys.argv[1:]):
         main_cli()
     else:
-        print(
-            "[run_algorithms.py] No CLI args detected → using CONFIG block at top of file.\n"
-            f"  game={CONFIG['game']}  algos={CONFIG['algos']}  L={CONFIG['L']}  "
-            f"αb={CONFIG['alpha_b']}  αs={CONFIG['alpha_s']}  Kf={CONFIG['Kf']}  ρ={CONFIG['rho']}  "
-            f"plot_total_regret={CONFIG.get('plot_total_regret', False)}\n"
-        )
-        main_vscode()
+        if CONFIG.get("matrix_sweep", False):
+            print(
+                "[run_algorithms.py] No CLI args detected → running matrix TolShrink sweep\n"
+                f"  games={CONFIG.get('matrix_games', 'blotto_4x3')}  T={CONFIG['T']}  eta={CONFIG['eta']}  "
+                f"runs={CONFIG.get('matrix_runs', 50)}  seed={CONFIG['seed']}\n"
+            )
+            main_matrix_config()
+        else:
+            print(
+                "[run_algorithms.py] No CLI args detected → using CONFIG block at top of file.\n"
+                f"  game={CONFIG['game']}  algos={CONFIG['algos']}  L={CONFIG['L']}  "
+                f"αb={CONFIG['alpha_b']}  αs={CONFIG['alpha_s']}  Kf={CONFIG['Kf']}  ρ={CONFIG['rho']}  "
+                f"plot_total_regret={CONFIG.get('plot_total_regret', False)}\n"
+            )
+            main_vscode()
