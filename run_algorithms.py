@@ -16,6 +16,7 @@ from komwu import (
     KomwuEOEnd,
     KomwuKD,
     KomwuEOKD,
+    KomwuTolShrinkExp,
 )
 
 # ====================== EDIT THIS WHEN RUNNING IN VS CODE ======================
@@ -251,6 +252,33 @@ def run_one_game(
     # One agent per player per algorithm
     algo_bundles: list[tuple[str, list]] = []
     for spec in algos:
+        base = spec.strip().split("[", 1)[0].strip().lower()
+
+        if base == "tolshrink_exp":
+            num_runs = 25
+            for idx in range(num_runs):
+                P = int(rng.integers(10, 30))
+                eps0 = float(rng.uniform(0.01, 0.4))
+                log_gamma = rng.uniform(np.log(1e-7), np.log(1e-1))
+                gamma = float(np.exp(log_gamma))
+
+                label = f"TolShrink-exp #{idx+1} (P={P}, eps0={eps0:.3f}, gamma={gamma:.3e})"
+                agents = []
+                for p in range(game.n_players):
+                    ag = KomwuTolShrinkExp(
+                        game.tpxs[p],
+                        eta=eta,
+                        P=P,
+                        eps0=eps0,
+                        gamma=gamma,
+                        dtype=DTYPE,
+                    )
+                    ag.b += np.asarray(rng.normal(0, 1e-12, size=ag.b.shape), dtype=DTYPE)
+                    ag._compute_x()
+                    agents.append(ag)
+                algo_bundles.append((label, agents))
+            continue
+
         label, factory = make_algo(spec, defaults)
         agents = []
         for p in range(game.n_players):

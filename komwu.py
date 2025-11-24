@@ -335,6 +335,111 @@ class KomwuKD(Komwu):
         self.last_gradient = g_t
 
 
+class KomwuTolShrinkExp(Komwu):
+    """
+    TolShrink-exp (sequence-form):
+
+    - Underlying direction is standard OMWU.
+    - Every P iterations, shrink logits toward uniform via scaling the
+      minimal centered logits that realize the current strategy.
+    - The shrink factor s_t is the smallest s in [0, 1] such that the
+      total-variation distance between the current strategy x and the
+      scaled strategy q(s) satisfies TV(x, q(s)) <= eps_t, where
+          eps_t = eps0 * exp(-gamma * t).
+    """
+
+    def __init__(self, tpx, eta: float = 0.3, P: int = 20, eps0: float = 0.1, gamma: float = 1e-4, dtype=None):
+        super().__init__(tpx, eta, dtype=dtype)
+        self.P = int(P)
+        self.eps0 = float(eps0)
+        self.gamma = float(gamma)
+        self._step = 0
+
+    def observe_gradient(self, gradient: np.ndarray):
+        g_t = np.asarray(gradient, dtype=self.dtype)
+
+        # diagnostics
+        self.sum_gradients += g_t
+        self.sum_ev += g_t.dot(self.next_strategy())
+
+        # standard OMWU direction
+        d_t = (self.dtype(2.0) * g_t) - self.last_gradient
+        self.b += self.dtype(self.eta) * d_t
+        self._compute_x()
+        self.last_gradient = g_t
+
+        # TolShrink-exp every P steps
+        self._step += 1
+        if self.P > 0 and (self._step % self.P == 0):
+            eps_t = self.eps0 * np.exp(-self.gamma * self._step)
+            self._apply_shrink(eps_t)
+
+    # ---------------------- TolShrink helpers ----------------------
+    def _apply_shrink(self, eps_tv: float):
+        base_logits = self._minimal_centered_logits(self.x)
+        s = self._minimal_scale_tv(base_logits, self.x, eps_tv)
+        self.b = self.dtype(s) * base_logits
+        self._compute_x()
+
+    def _minimal_centered_logits(self, x: np.ndarray) -> np.ndarray:
+        base = np.zeros_like(x, dtype=self.dtype)
+        for infoset in self.tpx.infosets:
+            parent_seq = infoset.parent_sequence_id
+            parent_prob = x[parent_seq]
+            parent_prob = max(parent_prob, 1e-16)
+            start = infoset.start_sequence_id
+            end = infoset.end_sequence_id + 1
+            local = x[start:end] / parent_prob
+            local = np.clip(local, 1e-16, 1.0)
+            log_local = np.log(local)
+            log_local -= np.mean(log_local)
+            base[start:end] = log_local
+        return base
+
+    def _strategy_from_logits(self, logits: np.ndarray) -> np.ndarray:
+        K_j = [None] * self.tpx.n_infosets
+        for infoset_id, infoset in enumerate(self.tpx.infosets):
+            terms = []
+            for seq in range(infoset.start_sequence_id, infoset.end_sequence_id + 1):
+                child_sum = self.dtype(0.0)
+                for child_infoset in self.tpx.children[seq]:
+                    child_sum += K_j[child_infoset.infoset_id]
+                terms.append(logits[seq] + child_sum)
+            K_j[infoset_id] = logsumexp_np(np.asarray(terms, dtype=self.dtype))
+
+        y = np.zeros(self.tpx.n_sequences, dtype=self.dtype)
+        for infoset in reversed(self.tpx.infosets):
+            Kj = K_j[infoset.infoset_id]
+            y_parent = y[infoset.parent_sequence_id]
+            for seq in range(infoset.start_sequence_id, infoset.end_sequence_id + 1):
+                child_sum = self.dtype(0.0)
+                for child_infoset in self.tpx.children[seq]:
+                    child_sum += K_j[child_infoset.infoset_id]
+                y[seq] = y_parent + logits[seq] + child_sum - Kj
+        x = np.exp(y)
+        return x
+
+    def _tv_dist(self, p: np.ndarray, q: np.ndarray) -> float:
+        return 0.5 * float(np.sum(np.abs(p - q)))
+
+    def _minimal_scale_tv(self, base_logits: np.ndarray, target_x: np.ndarray, eps_tv: float, n_steps: int = 25) -> float:
+        uniform_logits = np.zeros_like(base_logits, dtype=self.dtype)
+        uniform_x = self._strategy_from_logits(uniform_logits)
+        if self._tv_dist(uniform_x, target_x) <= eps_tv:
+            return 0.0
+
+        lo, hi = 0.0, 1.0
+        for _ in range(n_steps):
+            mid = 0.5 * (lo + hi)
+            trial_logits = self.dtype(mid) * base_logits
+            q = self._strategy_from_logits(trial_logits)
+            if self._tv_dist(q, target_x) <= eps_tv:
+                hi = mid
+            else:
+                lo = mid
+        return hi
+
+
 class KomwuEOKD(Komwu):
     """
     OMWU-EO-KD:
